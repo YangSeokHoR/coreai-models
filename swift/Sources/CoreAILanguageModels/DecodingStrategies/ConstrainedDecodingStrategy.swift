@@ -5,6 +5,7 @@
 
 import CoreAIShared
 import Foundation
+import Synchronization
 import Tokenizers
 
 /// Grammar-constrained decoding strategy using xgrammar.
@@ -61,7 +62,15 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             .map(Int32.init)
         let maxTokens = options.maxTokens ?? 512
 
-        try await inferenceEngine.reset()
+        // [kanana-yarn patch] 구조화 출력 접두 재사용. 원래는 매번 reset()으로 0부터 prefill.
+        // 같은 엔진의 직전 구조화 호출 프롬프트와 앞부분이 같으면 그 길이까지 KV를 남기고(reset(to:)) 나머지만 계산한다.
+        // 되감을 수 없는 경우(슬라이딩 윈도 등)는 reset(to:)가 던지므로 원래대로 0부터.
+        let reuse = Self.prefixReuseLength(for: inferenceEngine, input: inputTokens)
+        do {
+            try await inferenceEngine.reset(to: reuse)
+        } catch {
+            try await inferenceEngine.reset()
+        }
 
         return ConstrainedDecodedSequence(
             prepared: ConstrainedDecodedSequence.Prepared(
@@ -74,6 +83,24 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             samplingConfiguration: samplingConfiguration,
             stopSequences: stopSequences
         )
+    }
+
+    // MARK: - Prefix reuse ([kanana-yarn patch])
+
+    /// 환경 변수 COREAI_CONSTRAINED_PREFIX_REUSE=0 이면 끔
+    static let prefixReuseEnabled = ProcessInfo.processInfo.environment["COREAI_CONSTRAINED_PREFIX_REUSE"] != "0"
+    private static let lastPrompts = Mutex<[ObjectIdentifier: [Int32]]>([:])
+
+    /// 남길 KV 길이. 직전 프롬프트와의 공통 접두, 엔진이 처리한 길이, 입력-1(최소 1토큰은 새로 계산) 중 최소.
+    static func prefixReuseLength(for engine: any InferenceEngine, input: [Int32]) -> Int {
+        let key = ObjectIdentifier(engine as AnyObject)
+        let previous = lastPrompts.withLock { dict -> [Int32] in
+            defer { dict[key] = input }
+            return dict[key] ?? []
+        }
+        guard prefixReuseEnabled else { return 0 }
+        let common = zip(previous, input).prefix { $0 == $1 }.count
+        return max(0, min(common, engine.processedTokenCount, input.count - 1))
     }
 
     // MARK: - Private helpers
