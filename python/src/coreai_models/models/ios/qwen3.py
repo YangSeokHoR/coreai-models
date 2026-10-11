@@ -12,7 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3ForCausalLM as HFQwen3ForCausalLM,
 )
 
-from coreai_models._hf import resolve_rope_theta
+from coreai_models._hf import is_default_rope_scaling, resolve_rope_theta
 from coreai_models.models.base import BaseForCausalLMForiOS
 from coreai_models.primitives.ios.cache import KVCacheHandler
 from coreai_models.primitives.ios.mlp import MLP
@@ -190,7 +190,26 @@ class Qwen3Extend(nn.Module):
 
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         rope_theta = resolve_rope_theta(config)
-        self.rope = RoPECache(head_dim, config.max_position_embeddings, rope_theta)
+        if is_default_rope_scaling(config):
+            self.rope = RoPECache(head_dim, config.max_position_embeddings, rope_theta)
+        else:
+            # [kanana-yarn patch] compute scaled RoPE with the transformers reference implementation
+            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+            rope_type = config.rope_scaling.get("rope_type")
+            if rope_type not in ROPE_INIT_FUNCTIONS:
+                raise ValueError(f"unsupported rope_type for iOS: {rope_type}")
+            # build on CPU: the exporter constructs modules under a meta-device context
+            with torch.device("cpu"):
+                inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, torch.device("cpu"))
+            print(f"[kanana-yarn patch] rope_type={rope_type}, attention_scaling={attention_scaling:.4f}")
+            self.rope = RoPECache(
+                head_dim,
+                config.max_position_embeddings,
+                rope_theta,
+                inv_freq=inv_freq,
+                attention_scaling=attention_scaling,
+            )
 
     def forward(
         self,

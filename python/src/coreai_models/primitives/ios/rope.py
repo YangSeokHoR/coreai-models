@@ -63,11 +63,16 @@ class RoPECache(torch.nn.Module):
         head_dim: int,
         max_cache_size: int,
         base: float = 500_000,
+        inv_freq: torch.Tensor | None = None,
+        attention_scaling: float = 1.0,
     ) -> None:
         super().__init__()
         self._head_dim = head_dim
         self._max_cache_size = max_cache_size
         self._base = base
+        # [kanana-yarn patch] scaled RoPE (e.g. yarn) frequencies and attention scale
+        self._inv_freq = None if inv_freq is None else inv_freq.detach().to("cpu", torch.float32)
+        self._attention_scaling = float(attention_scaling)
         self._use_hf_impl = os.environ.get("USE_HF_IMPL", "False").lower() == "true"
         self._compute_sin_and_cos()
 
@@ -91,10 +96,13 @@ class RoPECache(torch.nn.Module):
         base = self._base
 
         with torch.device("cpu"):
-            theta = 1.0 / (
-                base
-                ** (torch.arange(start=0, end=head_dim, step=2, dtype=torch.float32) / head_dim)
-            )
+            if self._inv_freq is not None:
+                theta = self._inv_freq.clone()
+            else:
+                theta = 1.0 / (
+                    base
+                    ** (torch.arange(start=0, end=head_dim, step=2, dtype=torch.float32) / head_dim)
+                )
 
             if self._use_hf_impl:
                 theta = theta.to(dtype)
@@ -108,8 +116,9 @@ class RoPECache(torch.nn.Module):
 
             # Cache cos sin values
             emb = torch.concatenate((freqs, freqs), dim=-1)
-            self.cos_cached = torch.nn.Buffer(torch.cos(emb).to(dtype=dtype), persistent=False)
-            self.sin_cached = torch.nn.Buffer(torch.sin(emb).to(dtype=dtype), persistent=False)
+            scale = self._attention_scaling
+            self.cos_cached = torch.nn.Buffer((torch.cos(emb) * scale).to(dtype=dtype), persistent=False)
+            self.sin_cached = torch.nn.Buffer((torch.sin(emb) * scale).to(dtype=dtype), persistent=False)
 
     def gather_cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather the cached cos/sin values using the position_ids"""
